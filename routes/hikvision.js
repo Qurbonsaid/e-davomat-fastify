@@ -37,13 +37,30 @@ export default async function hikvisionRoutes(fastify) {
       }
 
       // Determine direction
-      const today = eventTime.toISOString().split("T")[0];
+      const today = `${eventTime.getFullYear()}-${String(eventTime.getMonth()+1).padStart(2,'0')}-${String(eventTime.getDate()).padStart(2,'0')}`;
       const todayLogs = await empSvc.getAttendanceLogs({
         employee_id: employee._id,
         date: today,
       });
-      const hasInLog = todayLogs.some((l) => l.direction === "in");
-      const direction = hasInLog ? "out" : "in";
+      
+      // Check for duplicate event within last 30 seconds
+      const thirtySecondsAgo = new Date(eventTime.getTime() - 30000);
+      const recentDuplicate = todayLogs.find(
+        (l) => new Date(l.eventTime).getTime() >= thirtySecondsAgo.getTime()
+      );
+      if (recentDuplicate) {
+        return reply
+          .status(200)
+          .send({ status: "ok", message: "Takroriy hodisa (30 soniya ichida)" });
+      }
+      
+      // Determine direction based on last log entry
+      let direction = "in"; // default to "in" if no logs exist
+      if (todayLogs.length > 0) {
+        // todayLogs is already sorted by eventTime descending (from service)
+        const lastLog = todayLogs[0];
+        direction = lastLog.direction === "out" ? "in" : "out";
+      }
 
       // Calculate late status
       let status = "on_time";
