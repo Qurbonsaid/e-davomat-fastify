@@ -12,7 +12,7 @@ const __dirname = dirname(__filename);
 async function corePlugins(fastify) {
   const allowedOrigins = [
     process.env.FRONTEND_URL || "http://localhost:5173",
-    "https://davomat.vercel.app",
+    "https://e-davomat.vercel.app",
   ];
   await fastify.register(cors, {
     origin: (origin, cb) => {
@@ -22,6 +22,8 @@ async function corePlugins(fastify) {
         cb(null, false);
       }
     },
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   });
   await fastify.register(formbody);
