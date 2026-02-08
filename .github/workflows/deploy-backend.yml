@@ -1,0 +1,323 @@
+# =============================================================================
+# SECURE BACKEND DEPLOYMENT WORKFLOW
+# =============================================================================
+# This workflow deploys the backend to a remote Linux server via SSH.
+# 
+# SECURITY FEATURES IMPLEMENTED:
+# 1. Principle of Least Privilege - Only 'contents: read' permission granted
+# 2. GitHub Environments - Secrets are scoped to 'production' environment
+# 3. Actions pinned to commit SHA - Prevents supply chain attacks
+# 4. DOT_ENV secret used for .env - Created directly on server
+# 5. Secret masking - All sensitive values are masked in logs
+# 6. Manual approval gate via GitHub Environments
+#
+# REQUIRED SECRETS:
+# - REMOTE_HOST: Server IP or hostname
+# - REMOTE_PASSWORD: SSH password for root user
+# - DOT_ENV: Complete .env file contents
+# - SSH_HOST_KEY (optional): Expected SSH host key for verification (prevents TOFU MITM)
+# =============================================================================
+
+name: Deploy Backend to Production
+
+# SECURITY: Restrict workflow permissions to minimum required
+# This follows the Principle of Least Privilege - the workflow only needs
+# to read repository contents, not write to it or access other resources
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+# SECURITY: Prevent concurrent deployments to avoid race conditions
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    
+    # SECURITY: GitHub Environments provide:
+    # 1. Scoped secrets - Secrets are only available in this environment
+    # 2. Manual approval gates - Require reviewers before deployment
+    # 3. Deployment protection rules - Branch restrictions, wait timers
+    # Configure this in: Settings > Environments > production
+    environment:
+      name: production
+    
+    # SECURITY: Job-level timeout prevents runaway processes
+    timeout-minutes: 15
+    
+    steps:
+      # =========================================================================
+      # STEP 1: MASK ALL SECRETS
+      # =========================================================================
+      # SECURITY: Explicitly mask all secret values to prevent accidental exposure
+      # This step runs FIRST to ensure secrets never appear in logs
+      - name: Mask sensitive values
+        run: |
+          echo "::add-mask::${{ secrets.REMOTE_HOST }}"
+          echo "::add-mask::${{ secrets.REMOTE_PASSWORD }}"
+          # Mask each line of DOT_ENV to prevent partial exposure
+          echo "${{ secrets.DOT_ENV }}" | while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              echo "::add-mask::$line"
+              # Also mask just the value part (after =)
+              value=$(echo "$line" | cut -d'=' -f2-)
+              if [ -n "$value" ]; then
+                echo "::add-mask::$value"
+              fi
+            fi
+          done
+
+      # =========================================================================
+      # STEP 2: CHECKOUT CODE
+      # =========================================================================
+      # SECURITY: Action pinned to full commit SHA to prevent supply chain attacks
+      # SHA corresponds to actions/checkout@v4.1.1
+      # Always verify SHA at: https://github.com/actions/checkout/releases
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          # SECURITY: Shallow clone reduces attack surface and speeds up checkout
+          fetch-depth: 1
+
+      # =========================================================================
+      # STEP 3: SETUP NODE.JS
+      # =========================================================================
+      # SECURITY: Action pinned to full commit SHA
+      # SHA corresponds to actions/setup-node@v4.0.2
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: '20'
+
+      # =========================================================================
+      # STEP 4: INSTALL REQUIRED SYSTEM PACKAGES
+      # =========================================================================
+      # SECURITY: Explicitly install required packages to ensure deterministic deployments
+      # This prevents failures if ubuntu-latest image changes
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zip unzip sshpass
+          echo "✅ System packages installed"
+
+      # =========================================================================
+      # STEP 5: CREATE DEPLOYMENT ARCHIVE
+      # =========================================================================
+      - name: Create deployment archive
+        run: |
+          # Create archive with only necessary files for production
+          # SECURITY: Only include production-required files to minimize attack surface
+          zip -r deploy-backend.zip \
+            app.js \
+            config/ \
+            models/ \
+            plugins/ \
+            routes/ \
+            services/ \
+            utils/ \
+            scripts/ \
+            package.json \
+            package-lock.json \
+            -x "**/__tests__/**" \
+            -x "**/test/**"
+          
+          # Output archive info for verification
+          echo "✅ Archive created successfully"
+          ls -lh deploy-backend.zip
+
+      # =========================================================================
+      # STEP 6: SETUP SSH HOST KEY VERIFICATION
+      # =========================================================================
+      # SECURITY: Add remote host key to known_hosts to enable host key verification
+      # If SSH_HOST_KEY secret is provided, it will be verified against the scanned key
+      # to prevent MITM attacks during the scan (not just trust-on-first-use)
+      - name: Setup SSH host key verification
+        run: |
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          
+          # Scan the remote host key
+          SCANNED_KEY=$(ssh-keyscan -p 22 -T 10 "$REMOTE_HOST")
+          
+          if [ -z "$SCANNED_KEY" ]; then
+            echo "❌ ERROR: Failed to retrieve host key from $REMOTE_HOST"
+            exit 1
+          fi
+          
+          # If SSH_HOST_KEY secret is provided, verify the scanned key matches
+          if [ -n "$SSH_HOST_KEY" ]; then
+            echo "🔐 Verifying host key against expected value..."
+            # Extract key algorithm and key data (handles variable field counts)
+            # Format: hostname/ip algorithm key [comment]
+            SCANNED_ALGO=$(echo "$SCANNED_KEY" | awk '{print $2}')
+            SCANNED_DATA=$(echo "$SCANNED_KEY" | awk '{print $3}')
+            
+            # Expected key can be in format: hostname/ip algorithm key OR just algorithm key
+            # Check field count to determine format
+            FIELD_COUNT=$(echo "$SSH_HOST_KEY" | awk '{print NF}')
+            if [ "$FIELD_COUNT" -ge 3 ]; then
+              # Full format with hostname (3+ fields)
+              EXPECTED_ALGO=$(echo "$SSH_HOST_KEY" | awk '{print $2}')
+              EXPECTED_DATA=$(echo "$SSH_HOST_KEY" | awk '{print $3}')
+            else
+              # Just algorithm and key (2 fields)
+              EXPECTED_ALGO=$(echo "$SSH_HOST_KEY" | awk '{print $1}')
+              EXPECTED_DATA=$(echo "$SSH_HOST_KEY" | awk '{print $2}')
+            fi
+            
+            if [ "$SCANNED_ALGO" = "$EXPECTED_ALGO" ] && [ "$SCANNED_DATA" = "$EXPECTED_DATA" ]; then
+              echo "✅ Host key verified successfully"
+            else
+              echo "❌ ERROR: Host key mismatch! Possible MITM attack."
+              echo "Deployment aborted for security reasons."
+              exit 1
+            fi
+          else
+            echo "⚠️  WARNING: SSH_HOST_KEY secret not set - using trust-on-first-use"
+            echo "   To prevent MITM attacks during initial scan, add the SSH_HOST_KEY secret"
+            echo "   Run: ssh-keyscan -p 22 YOUR_SERVER_IP"
+          fi
+          
+          # Add the verified (or TOFU) key to known_hosts
+          echo "$SCANNED_KEY" >> "$HOME/.ssh/known_hosts"
+          echo "✅ SSH host key added to known_hosts"
+        env:
+          REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+          SSH_HOST_KEY: ${{ secrets.SSH_HOST_KEY }}
+
+      # =========================================================================
+      # STEP 7: UPLOAD FILES TO SERVER
+      # =========================================================================
+      - name: Upload deployment archive to server
+        run: |
+          # SECURITY: Transfer zip archive to server with host key checking enabled
+          sshpass -p "$REMOTE_PASSWORD" scp \
+            deploy-backend.zip \
+            root@"$REMOTE_HOST":/tmp/deploy-backend.zip
+          
+          echo "✅ Archive uploaded to server"
+        env:
+          REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
+
+      # =========================================================================
+      # STEP 8: CREATE .ENV FILE ON SERVER
+      # =========================================================================
+      # SECURITY: Create .env file directly on server via SSH BEFORE starting the app
+      # This ensures the application has required environment variables on first boot
+      - name: Create .env file on server
+        run: |
+          printf '%s\n' "$DOT_ENV_CONTENT" | sshpass -p "$REMOTE_PASSWORD" ssh root@"$REMOTE_HOST" 'mkdir -p /root/davomat && cat > /root/davomat/.env && chmod 600 /root/davomat/.env && echo "✅ Environment file created with secure permissions"'
+        env:
+          REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
+          DOT_ENV_CONTENT: ${{ secrets.DOT_ENV }}
+
+      # =========================================================================
+      # STEP 9: DEPLOY ON SERVER
+      # =========================================================================
+      - name: Deploy application on server
+        run: |
+          sshpass -p "$REMOTE_PASSWORD" ssh root@"$REMOTE_HOST" << 'DEPLOY_SCRIPT'
+          
+          set -euo pipefail
+          
+          # Configuration
+          DEPLOY_DIR="$HOME/davomat"
+          APP_NAME="davomat"
+          
+          echo "=== Starting deployment ==="
+          
+          # Create deployment directory if it doesn't exist
+          mkdir -p "$DEPLOY_DIR"
+          cd "$DEPLOY_DIR"
+          
+          # Extract new deployment (overwrite existing files)
+          # This preserves runtime folders like uploads/, node_modules/ that aren't in the archive
+          echo "📂 Extracting deployment archive..."
+          unzip -o /tmp/deploy-backend.zip
+          
+          # Cleanup temporary files
+          rm -f /tmp/deploy-backend.zip
+          
+          # Install production dependencies (updates node_modules if needed)
+          echo "📥 Installing production dependencies..."
+          npm install --omit=dev
+          
+          # Manage PM2 process
+          echo "🔄 Managing PM2 process..."
+          
+          # Check if PM2 is installed
+          if ! command -v pm2 &> /dev/null; then
+            echo "❌ ERROR: PM2 is not installed on the server"
+            echo "Install with: npm install -g pm2"
+            exit 1
+          fi
+          
+          # Ensure uploads directory exists
+          mkdir -p "$DEPLOY_DIR/uploads"
+          
+          # Check if process exists and restart or create
+          if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
+            echo "🔄 Restarting existing PM2 process..."
+            pm2 restart "$APP_NAME" --update-env
+          else
+            echo "🚀 Creating new PM2 process..."
+            pm2 start app.js \
+              --name "$APP_NAME" \
+              --cwd "$DEPLOY_DIR" \
+              --time
+          fi
+          
+          # Save PM2 process list for auto-restart on reboot
+          pm2 save
+          
+          # Health check
+          echo "🏥 Performing health check..."
+          sleep 5
+          
+          if pm2 describe "$APP_NAME" | grep -q "online"; then
+            echo "✅ Deployment successful! Application is running."
+            pm2 logs "$APP_NAME" --lines 10 --nostream
+          else
+            echo "❌ Deployment may have failed. Checking logs..."
+            pm2 logs "$APP_NAME" --lines 50 --nostream
+            exit 1
+          fi
+          
+          echo "=== ✅ Deployment complete ==="
+          
+          DEPLOY_SCRIPT
+        env:
+          REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
+
+      # =========================================================================
+      # STEP 10: CLEANUP LOCAL FILES
+      # =========================================================================
+      # SECURITY: Always clean up sensitive files, even on failure
+      - name: Cleanup local files
+        if: always()
+        run: |
+          rm -f deploy-backend.zip
+          echo "✅ Local cleanup complete"
+
+      # =========================================================================
+      # STEP 11: DEPLOYMENT SUMMARY
+      # =========================================================================
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`production\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
