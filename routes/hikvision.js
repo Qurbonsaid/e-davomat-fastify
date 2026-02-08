@@ -36,14 +36,36 @@ export default async function hikvisionRoutes(fastify) {
           .send({ status: "ok", message: "Xodim topilmadi" });
       }
 
-      // Determine direction
-      const today = eventTime.toISOString().split("T")[0];
+      // Determine direction - construct date with local timezone semantics
+      const todayDate = new Date(
+        eventTime.getFullYear(),
+        eventTime.getMonth(),
+        eventTime.getDate()
+      );
+      
+      // Get only the most recent log for this employee today
       const todayLogs = await empSvc.getAttendanceLogs({
         employee_id: employee._id,
-        date: today,
+        date: todayDate,
+        limit: 1,
       });
-      const hasInLog = todayLogs.some((l) => l.direction === "in");
-      const direction = hasInLog ? "out" : "in";
+      
+      // Check for duplicate event within last 30 seconds (race condition mitigation)
+      const thirtySecondsAgo = new Date(eventTime.getTime() - 30000);
+      if (todayLogs.length > 0) {
+        const lastLogTime = new Date(todayLogs[0].eventTime).getTime();
+        if (lastLogTime >= thirtySecondsAgo.getTime()) {
+          return reply
+            .status(200)
+            .send({ status: "ok", message: "Takroriy hodisa (30 soniya ichida)" });
+        }
+      }
+      
+      // Determine direction based on last log entry
+      let direction = "in"; // default to "in" if no logs exist
+      if (todayLogs.length > 0) {
+        direction = todayLogs[0].direction === "out" ? "in" : "out";
+      }
 
       // Calculate late status
       let status = "on_time";
