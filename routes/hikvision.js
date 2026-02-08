@@ -36,30 +36,35 @@ export default async function hikvisionRoutes(fastify) {
           .send({ status: "ok", message: "Xodim topilmadi" });
       }
 
-      // Determine direction
-      const today = `${eventTime.getFullYear()}-${String(eventTime.getMonth()+1).padStart(2,'0')}-${String(eventTime.getDate()).padStart(2,'0')}`;
+      // Determine direction - construct date with local timezone semantics
+      const todayDate = new Date(
+        eventTime.getFullYear(),
+        eventTime.getMonth(),
+        eventTime.getDate()
+      );
+      
+      // Get only the most recent log for this employee today
       const todayLogs = await empSvc.getAttendanceLogs({
         employee_id: employee._id,
-        date: today,
+        date: todayDate,
+        limit: 1,
       });
       
-      // Check for duplicate event within last 30 seconds
+      // Check for duplicate event within last 30 seconds (race condition mitigation)
       const thirtySecondsAgo = new Date(eventTime.getTime() - 30000);
-      const recentDuplicate = todayLogs.find(
-        (l) => new Date(l.eventTime).getTime() >= thirtySecondsAgo.getTime()
-      );
-      if (recentDuplicate) {
-        return reply
-          .status(200)
-          .send({ status: "ok", message: "Takroriy hodisa (30 soniya ichida)" });
+      if (todayLogs.length > 0) {
+        const lastLogTime = new Date(todayLogs[0].eventTime).getTime();
+        if (lastLogTime >= thirtySecondsAgo.getTime()) {
+          return reply
+            .status(200)
+            .send({ status: "ok", message: "Takroriy hodisa (30 soniya ichida)" });
+        }
       }
       
       // Determine direction based on last log entry
       let direction = "in"; // default to "in" if no logs exist
       if (todayLogs.length > 0) {
-        // todayLogs is already sorted by eventTime descending (from service)
-        const lastLog = todayLogs[0];
-        direction = lastLog.direction === "out" ? "in" : "out";
+        direction = todayLogs[0].direction === "out" ? "in" : "out";
       }
 
       // Calculate late status
