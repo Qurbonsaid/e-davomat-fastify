@@ -64,3 +64,7 @@ export async function createAdmin({ username, password, fullName }) {
 export async function getUserFromToken(payload) {
   return User.findById(payload.id).lean();
 }
+
+export async function getUserById(id) {
+  return User.findById(id).select("+password");
+}

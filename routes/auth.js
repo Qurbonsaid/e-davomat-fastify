@@ -61,4 +61,45 @@ export default async function authRoutes(fastify) {
       return reply.send({ user: request.user });
     },
   });
+
+  // PUT /api/auth/profile — update fullName and/or password
+  fastify.put("/api/auth/profile", {
+    preHandler: [fastify.authenticate],
+    handler: async (request, reply) => {
+      const { fullName, currentPassword, newPassword } = request.body || {};
+
+      const user = await authService.getUserById(request.user.id);
+      if (!user) {
+        return reply.status(404).send({ error: "Foydalanuvchi topilmadi" });
+      }
+
+      if (fullName) {
+        user.fullName = fullName;
+      }
+
+      if (newPassword) {
+        if (!currentPassword) {
+          return reply
+            .status(400)
+            .send({ error: "Joriy parol kiritilishi shart" });
+        }
+        const valid = await user.comparePassword(currentPassword);
+        if (!valid) {
+          return reply.status(400).send({ error: "Joriy parol noto'g'ri" });
+        }
+        user.password = newPassword;
+      }
+
+      await user.save();
+
+      return reply.send({
+        user: {
+          id: user._id,
+          username: user.username,
+          fullName: user.fullName,
+          role: user.role,
+        },
+      });
+    },
+  });
 }
